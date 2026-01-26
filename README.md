@@ -12,17 +12,43 @@ A CLI toolkit for setting up git worktree workflows optimized for parallel devel
 
 ## Installation
 
+### One-liner Install (Recommended)
+
 ```bash
-git clone https://github.com/your-org/claude-worktree.git
+curl -fsSL https://raw.githubusercontent.com/OWNER/claude-worktree/main/install-remote.sh | bash
+```
+
+Replace `OWNER` with your GitHub username or organization.
+
+### Install Specific Version
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OWNER/claude-worktree/main/install-remote.sh | bash -s -- v1.0.0
+```
+
+### Install from Clone
+
+```bash
+git clone https://github.com/OWNER/claude-worktree.git
 cd claude-worktree
 ./install.sh
 ```
 
-Or manually:
+### Update
 
 ```bash
-ln -sf /path/to/claude-worktree/bin/cwt-init ~/.local/bin/cwt-init
-export PATH="$HOME/.local/bin:$PATH"
+cwt-init --update
+```
+
+### Uninstall
+
+```bash
+# If installed via ./install.sh
+./install.sh --uninstall
+
+# Or manually
+rm ~/.local/bin/cwt-init
+rm -rf ~/.claude-worktree
 ```
 
 ## Quick Start
@@ -193,6 +219,36 @@ git worktree repair
 ```bash
 chmod +x .claude/bin/wt
 ```
+
+## Creating Releases
+
+To publish a new version:
+
+1. Update the version in `VERSION` and `bin/cwt-init`:
+   ```bash
+   echo "1.1.0" > VERSION
+   # Also update VERSION="1.1.0" in bin/cwt-init
+   ```
+
+2. Commit the version bump:
+   ```bash
+   git add VERSION bin/cwt-init
+   git commit -m "chore: bump version to 1.1.0"
+   ```
+
+3. Create and push a tag:
+   ```bash
+   git tag v1.1.0
+   git push origin main --tags
+   ```
+
+4. Create a GitHub Release from the tag (optional but recommended):
+   - Go to your repo → Releases → "Draft a new release"
+   - Select the tag you just pushed
+   - Add release notes
+   - Publish
+
+Users can then update with `cwt-init --update`.
 
 ## License
 

@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck -x bin/cwt-init install.sh install-remote.sh
+
+  version-sync:
+    name: Version Sync Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version consistency
+        run: |
+          VERSION_FILE=$(cat VERSION | tr -d '[:space:]')
+          VERSION_SCRIPT=$(grep -m1 '^VERSION=' bin/cwt-init | cut -d'"' -f2)
+
+          echo "VERSION file: $VERSION_FILE"
+          echo "cwt-init:     $VERSION_SCRIPT"
+
+          if [[ "$VERSION_FILE" != "$VERSION_SCRIPT" ]]; then
+            echo "::error::Version mismatch! VERSION file ($VERSION_FILE) != bin/cwt-init ($VERSION_SCRIPT)"
+            exit 1
+          fi
+
+          echo "✓ Versions match"
+
+  install-test:
+    name: Install Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test local install
+        run: |
+          ./install.sh
+
+          # Verify installation
+          if [[ ! -f "$HOME/.claude-worktree/bin/cwt-init" ]]; then
+            echo "::error::cwt-init not installed to data directory"
+            exit 1
+          fi
+
+          if [[ ! -L "$HOME/.local/bin/cwt-init" ]]; then
+            echo "::error::Symlink not created"
+            exit 1
+          fi
+
+          echo "✓ Installation successful"
+
+      - name: Test --version flag
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          cwt-init --version
+
+      - name: Test --help flag
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          cwt-init --help
+
+      - name: Test uninstall
+        run: |
+          ./install.sh --uninstall
+
+          if [[ -L "$HOME/.local/bin/cwt-init" ]]; then
+            echo "::error::Symlink not removed"
+            exit 1
+          fi
+
+          echo "✓ Uninstall successful"
