@@ -45,7 +45,7 @@ do_install() {
   # Read version
   local version="dev"
   if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
-    version=$(cat "$SCRIPT_DIR/VERSION" | tr -d '[:space:]')
+    version=$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION")
   fi
 
   print_step "Version: $version"

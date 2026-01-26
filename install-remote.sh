@@ -57,7 +57,7 @@ detect_platform() {
   case "$OS" in
     Linux*)  PLATFORM="linux" ;;
     Darwin*) PLATFORM="darwin" ;;
-    *)       PLATFORM="unknown" ;;
+    *)       PLATFORM="unknown" ;;  # shellcheck disable=SC2034
   esac
 
   case "$ARCH" in
@@ -106,7 +106,7 @@ install_cwt() {
   local temp_dir
 
   temp_dir=$(mktemp -d)
-  trap "rm -rf $temp_dir" EXIT
+  trap 'rm -rf "$temp_dir"' EXIT
 
   print_step "Downloading claude-worktree ${version}..."
 
@@ -144,14 +144,12 @@ install_cwt() {
   # Store version info
   echo "$version" > "$DATA_DIR/.installed-version"
 
-  # Create symlinks in bin directory
-  for script in cwt-init; do
-    if [[ -f "$DATA_DIR/bin/$script" ]]; then
-      chmod +x "$DATA_DIR/bin/$script"
-      ln -sf "$DATA_DIR/bin/$script" "$INSTALL_DIR/$script"
-      print_success "Installed $script"
-    fi
-  done
+  # Create symlink for cwt-init
+  if [[ -f "$DATA_DIR/bin/cwt-init" ]]; then
+    chmod +x "$DATA_DIR/bin/cwt-init"
+    ln -sf "$DATA_DIR/bin/cwt-init" "$INSTALL_DIR/cwt-init"
+    print_success "Installed cwt-init"
+  fi
 
   # Make install script executable
   chmod +x "$DATA_DIR/install.sh"
