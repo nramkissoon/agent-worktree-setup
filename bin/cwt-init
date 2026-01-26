@@ -1,0 +1,1545 @@
+#!/usr/bin/env bash
+#
+# cwt-init - Initialize a Claude Code + git worktree workflow for any repository
+#
+# Usage:
+#   cwt-init                      # Interactive setup in current directory
+#   cwt-init <repo-url> <dir>     # Clone and setup new project
+#   cwt-init --help               # Show help
+#
+# This script sets up:
+#   - Bare git repository with worktrees
+#   - .claude directory with CLAUDE.md, skills, and settings
+#   - wt utility for worktree management
+#   - VS Code/Cursor workspace file
+#
+
+set -e
+
+VERSION="1.0.0"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Default configuration
+DEFAULT_BASE_BRANCH="main"
+DEFAULT_TICKET_SYSTEM="none"
+DEFAULT_PACKAGE_MANAGER="auto"
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+print_header() {
+  echo ""
+  echo -e "${BOLD}${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${BLUE}║${NC}  ${BOLD}Claude Worktree Init${NC} v${VERSION}                              ${BOLD}${BLUE}║${NC}"
+  echo -e "${BOLD}${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+}
+
+print_step() {
+  echo -e "${CYAN}▶${NC} $1"
+}
+
+print_success() {
+  echo -e "${GREEN}✓${NC} $1"
+}
+
+print_warning() {
+  echo -e "${YELLOW}⚠${NC} $1"
+}
+
+print_error() {
+  echo -e "${RED}✗${NC} $1"
+}
+
+prompt() {
+  local var_name="$1"
+  local prompt_text="$2"
+  local default_value="$3"
+
+  if [[ -n "$default_value" ]]; then
+    echo -en "${BOLD}$prompt_text${NC} [${default_value}]: "
+  else
+    echo -en "${BOLD}$prompt_text${NC}: "
+  fi
+
+  read -r input
+  if [[ -z "$input" && -n "$default_value" ]]; then
+    eval "$var_name=\"$default_value\""
+  else
+    eval "$var_name=\"$input\""
+  fi
+}
+
+prompt_choice() {
+  local var_name="$1"
+  local prompt_text="$2"
+  shift 2
+  local options=("$@")
+
+  echo -e "${BOLD}$prompt_text${NC}"
+  local i=1
+  for opt in "${options[@]}"; do
+    echo "  $i) $opt"
+    ((i++))
+  done
+  echo -en "Choice [1]: "
+  read -r choice
+
+  if [[ -z "$choice" ]]; then
+    choice=1
+  fi
+
+  if [[ "$choice" -ge 1 && "$choice" -le "${#options[@]}" ]]; then
+    eval "$var_name=\"${options[$((choice-1))]}\""
+  else
+    eval "$var_name=\"${options[0]}\""
+  fi
+}
+
+prompt_yes_no() {
+  local var_name="$1"
+  local prompt_text="$2"
+  local default="${3:-y}"
+
+  if [[ "$default" == "y" ]]; then
+    echo -en "${BOLD}$prompt_text${NC} [Y/n]: "
+  else
+    echo -en "${BOLD}$prompt_text${NC} [y/N]: "
+  fi
+
+  read -r response
+  if [[ -z "$response" ]]; then
+    response="$default"
+  fi
+
+  if [[ "$response" =~ ^[Yy]$ ]]; then
+    eval "$var_name=true"
+  else
+    eval "$var_name=false"
+  fi
+}
+
+detect_package_manager() {
+  local dir="$1"
+  if [[ -f "$dir/pnpm-lock.yaml" ]]; then
+    echo "pnpm"
+  elif [[ -f "$dir/yarn.lock" ]]; then
+    echo "yarn"
+  elif [[ -f "$dir/package-lock.json" ]]; then
+    echo "npm"
+  elif [[ -f "$dir/Cargo.toml" ]]; then
+    echo "cargo"
+  elif [[ -f "$dir/go.mod" ]]; then
+    echo "go"
+  elif [[ -f "$dir/requirements.txt" || -f "$dir/pyproject.toml" ]]; then
+    echo "python"
+  else
+    echo "none"
+  fi
+}
+
+# ============================================================================
+# Configuration Collection
+# ============================================================================
+
+collect_config() {
+  echo -e "${BOLD}${CYAN}Project Configuration${NC}"
+  echo ""
+
+  # Project name
+  prompt PROJECT_NAME "Project name" "$(basename "$PROJECT_ROOT")"
+
+  # Base branch
+  prompt BASE_BRANCH "Default base branch for new worktrees" "$DETECTED_DEFAULT_BRANCH"
+
+  # Ticket system
+  prompt_choice TICKET_SYSTEM "Ticket/issue tracking system:" \
+    "none" "linear" "github" "jira"
+
+  # Package manager / project type
+  local detected_pm=$(detect_package_manager "$WORKTREE_PATH")
+  if [[ "$detected_pm" != "none" ]]; then
+    print_success "Detected package manager: $detected_pm"
+    PACKAGE_MANAGER="$detected_pm"
+  else
+    prompt_choice PACKAGE_MANAGER "Project type:" \
+      "node-pnpm" "node-npm" "node-yarn" "rust" "go" "python" "other"
+  fi
+
+  # Verification commands
+  echo ""
+  echo -e "${BOLD}${CYAN}Verification Commands${NC}"
+  echo -e "These run before commits to ensure code quality."
+  echo ""
+
+  case "$PACKAGE_MANAGER" in
+    pnpm|node-pnpm)
+      prompt TYPE_CHECK_CMD "Type check command" "pnpm tsc --noEmit"
+      prompt BUILD_CMD "Build command" "pnpm build"
+      prompt TEST_CMD "Test command" "pnpm test"
+      prompt LINT_CMD "Lint command" "pnpm lint"
+      ;;
+    npm|node-npm)
+      prompt TYPE_CHECK_CMD "Type check command" "npm run typecheck"
+      prompt BUILD_CMD "Build command" "npm run build"
+      prompt TEST_CMD "Test command" "npm test"
+      prompt LINT_CMD "Lint command" "npm run lint"
+      ;;
+    yarn|node-yarn)
+      prompt TYPE_CHECK_CMD "Type check command" "yarn typecheck"
+      prompt BUILD_CMD "Build command" "yarn build"
+      prompt TEST_CMD "Test command" "yarn test"
+      prompt LINT_CMD "Lint command" "yarn lint"
+      ;;
+    cargo|rust)
+      prompt TYPE_CHECK_CMD "Type check command" "cargo check"
+      prompt BUILD_CMD "Build command" "cargo build"
+      prompt TEST_CMD "Test command" "cargo test"
+      prompt LINT_CMD "Lint command" "cargo clippy"
+      ;;
+    go)
+      prompt TYPE_CHECK_CMD "Type check command" "go vet ./..."
+      prompt BUILD_CMD "Build command" "go build ./..."
+      prompt TEST_CMD "Test command" "go test ./..."
+      prompt LINT_CMD "Lint command" "golangci-lint run"
+      ;;
+    python)
+      prompt TYPE_CHECK_CMD "Type check command" "mypy ."
+      prompt BUILD_CMD "Build command" "echo 'No build step'"
+      prompt TEST_CMD "Test command" "pytest"
+      prompt LINT_CMD "Lint command" "ruff check ."
+      ;;
+    *)
+      prompt TYPE_CHECK_CMD "Type check command" ""
+      prompt BUILD_CMD "Build command" ""
+      prompt TEST_CMD "Test command" ""
+      prompt LINT_CMD "Lint command" ""
+      ;;
+  esac
+
+  # Linear-specific config
+  if [[ "$TICKET_SYSTEM" == "linear" ]]; then
+    echo ""
+    echo -e "${BOLD}${CYAN}Linear Configuration${NC}"
+    prompt LINEAR_TEAM "Linear team key (e.g., ENG)" ""
+  fi
+
+  echo ""
+}
+
+# ============================================================================
+# File Generation
+# ============================================================================
+
+generate_wt_script() {
+  cat << 'WTSCRIPT'
+#!/usr/bin/env bash
+#
+# wt - Worktree management utility for bare repo setups
+#
+# Usage:
+#   wt add <name> [base-branch]      Create a new worktree
+#   wt remove <name>                 Remove a worktree
+#   wt list                          List all worktrees
+#   wt sync                          Sync workspace file with worktrees
+#   wt open [name]                   Open worktree in Cursor/VS Code
+#   wt status                        Show git status for all worktrees
+#   wt install-deps [name]           Install dependencies in worktree(s)
+#
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Load project config
+load_config() {
+  local project_root="$1"
+  if [[ -f "$project_root/.claude/config.sh" ]]; then
+    source "$project_root/.claude/config.sh"
+  fi
+}
+
+# Find project root (directory containing .bare)
+find_project_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -d "$dir/.bare" ]]; then
+      echo "$dir"
+      return 0
+    fi
+    if [[ -f "$dir/.git" ]]; then
+      local gitdir=$(cat "$dir/.git" | sed 's/gitdir: //')
+      local bare_dir=$(dirname $(dirname "$gitdir"))
+      if [[ -d "$bare_dir" && -d "$bare_dir/.bare" ]]; then
+        echo "$bare_dir"
+        return 0
+      fi
+    fi
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
+get_project_name() {
+  basename "$1"
+}
+
+usage() {
+  cat << EOF
+${BLUE}wt${NC} - Worktree management utility
+
+${YELLOW}Usage:${NC}
+  wt add <name> [base-branch]      Create a new worktree (default base from config)
+  wt remove <name>                 Remove a worktree
+  wt list                          List all worktrees
+  wt sync                          Sync workspace file with worktrees
+  wt open [name]                   Open worktree in Cursor (default: workspace)
+  wt status                        Show git status for all worktrees
+  wt install-deps [name]           Install dependencies in worktree(s)
+
+${YELLOW}Examples:${NC}
+  wt add eng-4721
+  wt add feature-auth main
+  wt remove eng-4721
+  wt open
+
+EOF
+}
+
+cmd_add() {
+  local name="$1"
+  local base_branch="${2:-$WT_DEFAULT_BRANCH}"
+  base_branch="${base_branch:-main}"
+
+  if [[ -z "$name" ]]; then
+    echo -e "${RED}Error:${NC} Missing worktree name"
+    echo "Usage: wt add <name> [base-branch]"
+    exit 1
+  fi
+
+  local project_root=$(find_project_root)
+  if [[ -z "$project_root" ]]; then
+    echo -e "${RED}Error:${NC} Not in a wt-managed project (no .bare directory found)"
+    exit 1
+  fi
+
+  load_config "$project_root"
+  base_branch="${2:-${WT_DEFAULT_BRANCH:-main}}"
+
+  cd "$project_root"
+
+  if [[ -d "$name" ]]; then
+    echo -e "${RED}Error:${NC} Worktree '$name' already exists"
+    exit 1
+  fi
+
+  local branch_name="$name"
+  if [[ ! "$name" =~ ^[a-z]+-[0-9]+$ ]]; then
+    branch_name="feature/$name"
+  fi
+
+  echo -e "${BLUE}Creating worktree:${NC} $name (branch: $branch_name from $base_branch)"
+
+  cd .bare
+  git fetch origin "$base_branch" 2>/dev/null || git fetch origin
+
+  if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+    echo -e "${YELLOW}Branch exists, checking out...${NC}"
+    git worktree add "../$name" "$branch_name"
+  else
+    echo -e "${YELLOW}Creating new branch from $base_branch...${NC}"
+    git worktree add "../$name" "origin/$base_branch" -b "$branch_name"
+  fi
+  cd ..
+
+  # Set up .claude symlink
+  if [[ -d ".claude" ]]; then
+    echo -e "${YELLOW}Setting up .claude symlink...${NC}"
+    mkdir -p "$name/.claude"
+    ln -sf "../../.claude/CLAUDE.md" "$name/.claude/CLAUDE.md"
+    [[ -f ".claude/settings.local.json" ]] && ln -sf "../../.claude/settings.local.json" "$name/.claude/settings.local.json"
+  fi
+
+  cmd_sync
+
+  if [[ -f "$name/package.json" ]]; then
+    echo ""
+    echo -e "${YELLOW}Detected package.json. Install dependencies? [Y/n]${NC}"
+    read -r response
+    if [[ ! "$response" =~ ^[Nn]$ ]]; then
+      cmd_install_deps "$name"
+    fi
+  fi
+
+  echo -e "${GREEN}✓ Worktree '$name' created successfully!${NC}"
+}
+
+cmd_remove() {
+  local name="$1"
+
+  if [[ -z "$name" ]]; then
+    echo -e "${RED}Error:${NC} Missing worktree name"
+    exit 1
+  fi
+
+  local project_root=$(find_project_root)
+  if [[ -z "$project_root" ]]; then
+    echo -e "${RED}Error:${NC} Not in a wt-managed project"
+    exit 1
+  fi
+
+  cd "$project_root"
+
+  if [[ ! -d "$name" ]]; then
+    echo -e "${RED}Error:${NC} Worktree '$name' not found"
+    exit 1
+  fi
+
+  if [[ -n $(cd "$name" && git status --porcelain) ]]; then
+    echo -e "${YELLOW}Warning:${NC} Worktree has uncommitted changes:"
+    (cd "$name" && git status --short)
+    echo ""
+    echo -e "${YELLOW}Remove anyway? [y/N]${NC}"
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+      echo "Aborted."
+      exit 1
+    fi
+  fi
+
+  echo -e "${BLUE}Removing worktree:${NC} $name"
+
+  local branch_name=$(cd "$name" && git branch --show-current)
+
+  cd .bare
+  git worktree remove "../$name" --force
+  cd ..
+
+  echo -e "${YELLOW}Delete branch '$branch_name'? [y/N]${NC}"
+  read -r response
+  if [[ "$response" =~ ^[Yy]$ ]]; then
+    cd .bare
+    git branch -D "$branch_name" 2>/dev/null || true
+    cd ..
+    echo -e "${GREEN}✓ Branch deleted${NC}"
+  fi
+
+  cmd_sync
+
+  echo -e "${GREEN}✓ Worktree '$name' removed successfully!${NC}"
+}
+
+cmd_list() {
+  local project_root=$(find_project_root)
+  if [[ -z "$project_root" ]]; then
+    echo -e "${RED}Error:${NC} Not in a wt-managed project"
+    exit 1
+  fi
+
+  cd "$project_root"
+
+  echo -e "${BLUE}Worktrees:${NC}"
+  echo ""
+
+  cd .bare
+  git worktree list | while read -r line; do
+    local path=$(echo "$line" | awk '{print $1}')
+    local commit=$(echo "$line" | awk '{print $2}')
+    local branch=$(echo "$line" | awk '{print $3}' | tr -d '[]')
+
+    if [[ "$path" == *".bare" ]]; then
+      continue
+    fi
+
+    local name=$(basename "$path")
+    local status=""
+
+    if [[ -d "$path" ]]; then
+      if [[ -n $(cd "$path" && git status --porcelain 2>/dev/null) ]]; then
+        status="${YELLOW}*${NC}"
+      fi
+    fi
+
+    printf "  ${GREEN}%-20s${NC} ${BLUE}%-40s${NC} %s %s\n" "$name" "$branch" "$commit" "$status"
+  done
+  cd ..
+
+  echo ""
+  echo -e "  ${YELLOW}*${NC} = has uncommitted changes"
+}
+
+cmd_sync() {
+  local project_root=$(find_project_root)
+  if [[ -z "$project_root" ]]; then
+    echo -e "${RED}Error:${NC} Not in a wt-managed project"
+    exit 1
+  fi
+
+  cd "$project_root"
+  load_config "$project_root"
+
+  local project_name=$(get_project_name "$project_root")
+  local workspace_file="${project_name}.code-workspace"
+
+  echo -e "${BLUE}Syncing workspace file...${NC}"
+
+  local worktrees=()
+  while IFS= read -r path; do
+    if [[ "$path" != *".bare" ]]; then
+      worktrees+=("$(basename "$path")")
+    fi
+  done < <(cd .bare && git worktree list | awk '{print $1}')
+
+  IFS=$'\n' worktrees=($(sort <<<"${worktrees[*]}")); unset IFS
+
+  {
+    echo '{'
+    echo '  "folders": ['
+
+    local count=0
+    local total=${#worktrees[@]}
+    for name in "${worktrees[@]}"; do
+      ((count++))
+      echo "    {\"name\": \"$name\", \"path\": \"$name\"},"
+    done
+
+    echo '    {"name": ".claude (shared)", "path": ".claude"}'
+    echo '  ],'
+    echo '  "settings": {'
+    echo '    "git.repositoryScanMaxDepth": 1,'
+    echo '    "files.exclude": {'
+    echo '      "**/.git": true,'
+    echo '      "**/node_modules": true'
+    echo '    }'
+    echo '  }'
+    echo '}'
+  } > "$workspace_file"
+
+  echo -e "${GREEN}✓ Workspace synced: $workspace_file${NC}"
+}
+
+cmd_open() {
+  local name="$1"
+
+  local project_root=$(find_project_root)
+  if [[ -z "$project_root" ]]; then
+    echo -e "${RED}Error:${NC} Not in a wt-managed project"
+    exit 1
+  fi
+
+  cd "$project_root"
+
+  local project_name=$(get_project_name "$project_root")
+
+  if [[ -z "$name" ]]; then
+    local workspace_file="${project_name}.code-workspace"
+    if [[ -f "$workspace_file" ]]; then
+      echo -e "${BLUE}Opening workspace in Cursor...${NC}"
+      cursor "$workspace_file" 2>/dev/null || code "$workspace_file"
+    else
+      echo -e "${RED}Error:${NC} Workspace file not found. Run 'wt sync' first."
+      exit 1
+    fi
+  else
+    if [[ -d "$name" ]]; then
+      echo -e "${BLUE}Opening worktree '$name'...${NC}"
+      cursor "$name" 2>/dev/null || code "$name"
+    else
+      echo -e "${RED}Error:${NC} Worktree '$name' not found"
+      exit 1
+    fi
+  fi
+}
+
+cmd_status() {
+  local project_root=$(find_project_root)
+  if [[ -z "$project_root" ]]; then
+    echo -e "${RED}Error:${NC} Not in a wt-managed project"
+    exit 1
+  fi
+
+  cd "$project_root"
+
+  echo -e "${BLUE}Worktree Status:${NC}"
+  echo ""
+
+  cd .bare
+  git worktree list | while read -r line; do
+    local path=$(echo "$line" | awk '{print $1}')
+
+    if [[ "$path" == *".bare" ]]; then
+      continue
+    fi
+
+    local name=$(basename "$path")
+    echo -e "${GREEN}$name${NC}:"
+
+    if [[ -d "$path" ]]; then
+      (cd "$path" && git status --short)
+      local status=$(cd "$path" && git status --short)
+      if [[ -z "$status" ]]; then
+        echo "  (clean)"
+      fi
+    fi
+    echo ""
+  done
+  cd ..
+}
+
+cmd_install_deps() {
+  local name="$1"
+
+  local project_root=$(find_project_root)
+  if [[ -z "$project_root" ]]; then
+    echo -e "${RED}Error:${NC} Not in a wt-managed project"
+    exit 1
+  fi
+
+  cd "$project_root"
+
+  install_in_worktree() {
+    local wt_path="$1"
+    local wt_name=$(basename "$wt_path")
+
+    if [[ ! -f "$wt_path/package.json" ]]; then
+      return
+    fi
+
+    echo -e "${BLUE}Installing dependencies in $wt_name...${NC}"
+
+    cd "$wt_path"
+
+    if [[ -f "pnpm-lock.yaml" ]]; then
+      pnpm install
+    elif [[ -f "yarn.lock" ]]; then
+      yarn install
+    elif [[ -f "package-lock.json" ]]; then
+      npm install
+    else
+      npm install
+    fi
+
+    cd "$project_root"
+    echo -e "${GREEN}✓ Dependencies installed in $wt_name${NC}"
+  }
+
+  if [[ -n "$name" ]]; then
+    if [[ -d "$name" ]]; then
+      install_in_worktree "$project_root/$name"
+    else
+      echo -e "${RED}Error:${NC} Worktree '$name' not found"
+      exit 1
+    fi
+  else
+    cd .bare
+    git worktree list | while read -r line; do
+      local path=$(echo "$line" | awk '{print $1}')
+      if [[ "$path" != *".bare" && -d "$path" ]]; then
+        install_in_worktree "$path"
+      fi
+    done
+    cd ..
+  fi
+}
+
+main() {
+  local cmd="$1"
+  shift || true
+
+  case "$cmd" in
+    add|new|create)
+      cmd_add "$@"
+      ;;
+    remove|rm|delete)
+      cmd_remove "$@"
+      ;;
+    list|ls)
+      cmd_list "$@"
+      ;;
+    sync)
+      cmd_sync "$@"
+      ;;
+    open)
+      cmd_open "$@"
+      ;;
+    status|st)
+      cmd_status "$@"
+      ;;
+    install-deps|deps)
+      cmd_install_deps "$@"
+      ;;
+    help|--help|-h|"")
+      usage
+      ;;
+    *)
+      echo -e "${RED}Error:${NC} Unknown command '$cmd'"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
+WTSCRIPT
+}
+
+generate_config_sh() {
+  cat << EOF
+# Claude Worktree Configuration
+# Generated by cwt-init
+
+# Project settings
+export WT_PROJECT_NAME="${PROJECT_NAME}"
+export WT_DEFAULT_BRANCH="${BASE_BRANCH}"
+export WT_TICKET_SYSTEM="${TICKET_SYSTEM}"
+export WT_PACKAGE_MANAGER="${PACKAGE_MANAGER}"
+
+# Verification commands
+export WT_TYPE_CHECK_CMD="${TYPE_CHECK_CMD}"
+export WT_BUILD_CMD="${BUILD_CMD}"
+export WT_TEST_CMD="${TEST_CMD}"
+export WT_LINT_CMD="${LINT_CMD}"
+
+# Ticket system config
+export WT_LINEAR_TEAM="${LINEAR_TEAM:-}"
+EOF
+}
+
+generate_claude_md() {
+  cat << EOF
+# CLAUDE.md
+
+${PROJECT_NAME} - Project documentation for Claude Code.
+
+## Commands
+
+### Development
+EOF
+
+  case "$PACKAGE_MANAGER" in
+    pnpm|node-pnpm)
+      cat << 'EOF'
+- `pnpm dev` - Run development server
+- `pnpm build` - Build for production
+- `pnpm test` - Run tests
+- `pnpm lint` - Run linting
+EOF
+      ;;
+    npm|node-npm)
+      cat << 'EOF'
+- `npm run dev` - Run development server
+- `npm run build` - Build for production
+- `npm test` - Run tests
+- `npm run lint` - Run linting
+EOF
+      ;;
+    yarn|node-yarn)
+      cat << 'EOF'
+- `yarn dev` - Run development server
+- `yarn build` - Build for production
+- `yarn test` - Run tests
+- `yarn lint` - Run linting
+EOF
+      ;;
+    cargo|rust)
+      cat << 'EOF'
+- `cargo run` - Run the application
+- `cargo build` - Build the project
+- `cargo test` - Run tests
+- `cargo clippy` - Run linter
+EOF
+      ;;
+    go)
+      cat << 'EOF'
+- `go run .` - Run the application
+- `go build` - Build the project
+- `go test ./...` - Run tests
+- `golangci-lint run` - Run linter
+EOF
+      ;;
+    python)
+      cat << 'EOF'
+- `python main.py` - Run the application
+- `pytest` - Run tests
+- `ruff check .` - Run linter
+- `mypy .` - Run type checker
+EOF
+      ;;
+    *)
+      cat << 'EOF'
+- Add your development commands here
+EOF
+      ;;
+  esac
+
+  cat << 'EOF'
+
+## Architecture
+
+Describe your project architecture here.
+
+## Code Style
+
+Document your coding conventions here.
+
+### Enforced Conventions
+- Add your team's coding conventions
+- Document patterns to follow
+- Note any anti-patterns to avoid
+
+## Testing
+
+- Tests are colocated with source files (e.g., `*.spec.ts`)
+- Run tests before committing
+
+## External Services
+
+List any external services or APIs used.
+EOF
+}
+
+generate_settings_json() {
+  cat << EOF
+{
+  "permissions": {
+    "allow": [
+      "Bash(git worktree:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git fetch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "WebSearch",
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(./.claude/bin/wt:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
+EOF
+}
+
+generate_skill_commit() {
+  cat << EOF
+---
+name: commit
+description: Create a well-formatted git commit following conventional commits
+argument-hint: "[optional: summary of changes]"
+EOF
+
+  # Only add hooks if we have a type check command
+  if [[ -n "$TYPE_CHECK_CMD" ]]; then
+    cat << EOF
+hooks:
+  PreToolUse:
+    - matcher: "Bash(git commit:*)"
+      hooks:
+        - type: command
+          command: "${TYPE_CHECK_CMD} 2>&1 || (echo 'Type check failed - fix errors before committing' >&2 && exit 2)"
+EOF
+  fi
+
+  cat << 'EOF'
+---
+
+Create a git commit for the current changes.
+
+## Process
+
+1. Run `git status` and `git diff --staged` to understand the changes
+2. If nothing is staged, stage relevant files with `git add`
+3. Analyze the changes to determine the commit type and scope
+4. Write a commit message following the format below
+5. Create the commit
+6. Show the result with `git log -1`
+
+## Commit Message Format
+
+```
+<type>(<scope>): <short description>
+
+<body - explain what and why, not how>
+
+Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+## Types
+
+- `feat` - New feature or capability
+- `fix` - Bug fix
+- `refactor` - Code change that neither fixes a bug nor adds a feature
+- `perf` - Performance improvement
+- `test` - Adding or updating tests
+- `docs` - Documentation only
+- `chore` - Maintenance tasks, dependencies, config
+
+## Rules
+
+- Keep the short description under 72 characters
+- Use imperative mood ("add feature" not "added feature")
+- Don't end the short description with a period
+- Body should explain WHY, not WHAT (the diff shows what)
+EOF
+}
+
+generate_skill_pr() {
+  cat << EOF
+---
+name: pr
+description: Create a GitHub pull request with proper formatting
+argument-hint: "[optional: PR title or description]"
+EOF
+
+  if [[ -n "$TYPE_CHECK_CMD" ]]; then
+    cat << EOF
+hooks:
+  PreToolUse:
+    - matcher: "Bash(gh pr create:*)"
+      hooks:
+        - type: command
+          command: "${TYPE_CHECK_CMD} 2>&1 || (echo 'Type check failed - fix errors before creating PR' >&2 && exit 2)"
+EOF
+  fi
+
+  cat << EOF
+---
+
+Create a GitHub pull request for the current branch.
+
+## Process
+
+1. Run \`git status\` to verify branch state
+2. Run \`git log ${BASE_BRANCH}..HEAD\` to see all commits being merged
+3. Run \`git diff ${BASE_BRANCH}...HEAD\` to see all changes
+4. Check if branch is pushed: \`git status -sb\`
+5. Push if needed: \`git push -u origin HEAD\`
+6. Create the PR using \`gh pr create\`
+
+## PR Format
+
+\`\`\`markdown
+## Summary
+<2-4 bullet points describing the changes>
+
+## Changes
+<List key files/areas modified>
+
+## Test Plan
+- [ ] <How to test this change>
+- [ ] <Edge cases considered>
+
+## Related
+- Fixes #<issue-number> (if applicable)
+
+Generated with [Claude Code](https://claude.com/claude-code)
+\`\`\`
+
+## Rules
+
+- Target branch is \`${BASE_BRANCH}\`
+- Title should follow conventional commit format
+- Keep summary concise but complete
+- Include test plan with actionable steps
+
+## Command
+
+\`\`\`bash
+gh pr create --base ${BASE_BRANCH} --title "<title>" --body "\$(cat <<'PREOF'
+<body content>
+PREOF
+)"
+\`\`\`
+EOF
+}
+
+generate_skill_plan_ticket() {
+  cat << EOF
+---
+name: plan-ticket
+description: Investigate and create an implementation plan for a ticket
+argument-hint: "<ticket-id> [worktree-path]"
+allowed-tools:
+EOF
+
+  if [[ "$TICKET_SYSTEM" == "linear" ]]; then
+    echo "  - mcp__linear-server__get_issue"
+  fi
+
+  cat << EOF
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - Task
+---
+
+# Plan Ticket - Investigation & Planning
+
+Create a detailed implementation plan for a ticket by investigating the codebase.
+
+## Arguments
+
+- \`\$ARGUMENTS\` format: \`<ticket-id> [worktree-path]\`
+- If worktree path not provided, use current directory
+
+## Workflow
+
+### Step 1: Get Ticket Details
+EOF
+
+  if [[ "$TICKET_SYSTEM" == "linear" ]]; then
+    cat << 'EOF'
+
+Fetch the ticket using `mcp__linear-server__get_issue`:
+```
+mcp__linear-server__get_issue with:
+  - issueId: {ticket-id from arguments}
+```
+EOF
+  elif [[ "$TICKET_SYSTEM" == "github" ]]; then
+    cat << 'EOF'
+
+Fetch the issue using GitHub CLI:
+```bash
+gh issue view {ticket-id}
+```
+EOF
+  else
+    cat << 'EOF'
+
+Get ticket details from the user or ticket system.
+EOF
+  fi
+
+  cat << 'EOF'
+
+### Step 2: Read Project Context
+
+Read the CLAUDE.md file to understand:
+- Project structure
+- Available commands
+- Code conventions
+
+```
+Read: {worktree-path}/.claude/CLAUDE.md
+```
+
+### Step 3: Investigate Codebase
+
+Based on the ticket description, search for relevant code:
+
+1. **Keyword search** - Find files mentioning key concepts
+2. **File pattern search** - Find files by type/location
+3. **Read key files** - Examine the most relevant files
+
+### Step 4: Create Implementation Plan
+
+Write a detailed plan to `.claude/plans/{ticket-id}.md`:
+
+```markdown
+# {TICKET-ID}: {Title}
+
+## Summary
+{One paragraph describing what needs to be done}
+
+## Files to Modify
+- `path/to/file1.ts` - {changes needed}
+- `path/to/file2.ts` - {changes needed}
+
+## Implementation Steps
+1. Step one with details
+2. Step two with details
+
+## Testing Strategy
+How to verify the changes work.
+
+## Risks/Considerations
+Any potential issues or edge cases.
+```
+
+### Step 5: Return Summary
+
+After creating the plan, return a concise summary.
+EOF
+}
+
+generate_skill_implement_ticket() {
+  cat << EOF
+---
+name: implement-ticket
+description: Implement a planned ticket with verification hooks
+argument-hint: "<ticket-id> [worktree-path]"
+allowed-tools:
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - Bash
+  - TodoWrite
+EOF
+
+  # Only add hooks if we have verification commands
+  if [[ -n "$TYPE_CHECK_CMD" || -n "$BUILD_CMD" || -n "$TEST_CMD" ]]; then
+    cat << EOF
+hooks:
+  PreToolUse:
+    - matcher: "Bash(git commit:*)"
+      hooks:
+EOF
+
+    [[ -n "$TYPE_CHECK_CMD" ]] && cat << EOF
+        - type: command
+          command: "echo '=== Running Type Check ===' && ${TYPE_CHECK_CMD} 2>&1"
+EOF
+
+    [[ -n "$BUILD_CMD" ]] && cat << EOF
+        - type: command
+          command: "echo '=== Running Build ===' && ${BUILD_CMD} 2>&1"
+EOF
+
+    [[ -n "$TEST_CMD" ]] && cat << EOF
+        - type: command
+          command: "echo '=== Running Tests ===' && ${TEST_CMD} 2>&1"
+EOF
+  fi
+
+  cat << EOF
+---
+
+# Implement Ticket - Execute Implementation Plan
+
+Implement changes for a ticket following its plan, with automatic verification.
+
+## Arguments
+
+- \`\$ARGUMENTS\` format: \`<ticket-id> [worktree-path]\`
+- If worktree path not provided, use current directory
+
+## Pre-Commit Verification
+
+Before any \`git commit\` command, the following hooks run automatically:
+EOF
+
+  [[ -n "$TYPE_CHECK_CMD" ]] && echo "1. **Type Check**: \`${TYPE_CHECK_CMD}\` - Must pass"
+  [[ -n "$BUILD_CMD" ]] && echo "2. **Build**: \`${BUILD_CMD}\` - Must pass"
+  [[ -n "$TEST_CMD" ]] && echo "3. **Tests**: \`${TEST_CMD}\` - Must pass"
+
+  cat << 'EOF'
+
+If any verification fails, the commit is blocked.
+
+## Workflow
+
+### Step 1: Read Implementation Plan
+
+Read the plan file:
+```
+Read: {worktree-path}/.claude/plans/{ticket-id}.md
+```
+
+### Step 2: Create Todo List
+
+Use `TodoWrite` to create a task list from the implementation steps.
+
+### Step 3: Implement Changes
+
+For each implementation step:
+1. Read the target file(s) before making changes
+2. Make the changes using Edit or Write tools
+3. Mark the todo as complete
+
+### Step 4: Verification & Commit
+
+After implementation, attempt to commit. The pre-commit hooks will:
+1. Run verification commands
+2. Block commit if any fail
+3. Allow you to fix issues and retry
+
+### Step 5: Report Status
+
+Return a completion report with:
+- Changes made
+- Verification results
+- Commit hash and message
+- Any issues encountered
+EOF
+}
+
+generate_skill_work_tickets() {
+  if [[ "$TICKET_SYSTEM" != "linear" ]]; then
+    return
+  fi
+
+  cat << EOF
+---
+name: work-tickets
+description: Fetch Linear tickets, create worktrees, plan and implement in parallel
+argument-hint: "[optional: ticket IDs to work on directly]"
+allowed-tools:
+  - mcp__linear-server__list_issues
+  - mcp__linear-server__get_issue
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - Task
+  - AskUserQuestion
+  - TodoWrite
+---
+
+# Work Tickets - Linear Task Automation
+
+Automate working on Linear tickets: fetch active tickets, create git worktrees, plan implementations, and execute in parallel.
+
+## Workflow
+
+### Step 1: Fetch Linear Tickets
+
+Fetch your assigned tickets by querying each active state:
+
+\`\`\`
+mcp__linear-server__list_issues with:
+  - assignee: "me"
+  - state: "Todo"
+  - includeArchived: false
+  - limit: 25
+
+mcp__linear-server__list_issues with:
+  - assignee: "me"
+  - state: "In Progress"
+  - includeArchived: false
+  - limit: 25
+\`\`\`
+
+### Step 2: Present Tickets & Get Selection
+
+Display tickets in a table and use \`AskUserQuestion\` to select which to work on.
+
+### Step 3: Create Worktrees
+
+For each selected ticket:
+
+\`\`\`bash
+./.claude/bin/wt add {ticket-id-lower}
+\`\`\`
+
+### Step 4: Plan in Parallel
+
+Spawn Task agents with \`subagent_type: "Plan"\` for each ticket.
+
+### Step 5: Review & Approve Plans
+
+Present plans to user for approval.
+
+### Step 6: Implement in Parallel
+
+Spawn Task agents with \`subagent_type: "general-purpose"\` for approved tickets.
+
+### Step 7: Report Results
+
+Present summary of completed/failed implementations.
+EOF
+}
+
+# ============================================================================
+# Main Setup Functions
+# ============================================================================
+
+setup_bare_repo() {
+  local repo_url="$1"
+  local directory="$2"
+
+  print_step "Creating project directory..."
+  mkdir -p "$directory"
+  cd "$directory"
+  PROJECT_ROOT="$PWD"
+
+  print_step "Cloning bare repository..."
+  git clone --bare "$repo_url" .bare
+
+  cd .bare
+  git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+  git fetch origin
+  cd ..
+
+  # Detect default branch
+  DETECTED_DEFAULT_BRANCH=$(cd .bare && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+  if ! (cd .bare && git show-ref --verify --quiet "refs/remotes/origin/$DETECTED_DEFAULT_BRANCH" 2>/dev/null); then
+    for branch in main master develop; do
+      if (cd .bare && git show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null); then
+        DETECTED_DEFAULT_BRANCH="$branch"
+        break
+      fi
+    done
+  fi
+
+  print_success "Default branch detected: $DETECTED_DEFAULT_BRANCH"
+
+  # Create main worktree
+  print_step "Creating main worktree ($DETECTED_DEFAULT_BRANCH)..."
+  cd .bare
+  git worktree add "../$DETECTED_DEFAULT_BRANCH" "$DETECTED_DEFAULT_BRANCH"
+  cd ..
+
+  WORKTREE_PATH="$PROJECT_ROOT/$DETECTED_DEFAULT_BRANCH"
+
+  print_success "Bare repository setup complete"
+}
+
+setup_claude_directory() {
+  print_step "Setting up .claude directory..."
+
+  mkdir -p .claude/bin
+  mkdir -p .claude/skills/commit
+  mkdir -p .claude/skills/pr
+  mkdir -p .claude/skills/plan-ticket
+  mkdir -p .claude/skills/implement-ticket
+  mkdir -p .claude/plans
+
+  if [[ "$TICKET_SYSTEM" == "linear" ]]; then
+    mkdir -p .claude/skills/work-tickets
+  fi
+
+  # Generate files
+  print_step "Generating configuration files..."
+
+  generate_wt_script > .claude/bin/wt
+  chmod +x .claude/bin/wt
+
+  generate_config_sh > .claude/config.sh
+  generate_claude_md > .claude/CLAUDE.md
+  generate_settings_json > .claude/settings.local.json
+
+  # Generate skills
+  print_step "Generating skills..."
+
+  generate_skill_commit > .claude/skills/commit/SKILL.md
+  generate_skill_pr > .claude/skills/pr/SKILL.md
+  generate_skill_plan_ticket > .claude/skills/plan-ticket/SKILL.md
+  generate_skill_implement_ticket > .claude/skills/implement-ticket/SKILL.md
+
+  if [[ "$TICKET_SYSTEM" == "linear" ]]; then
+    generate_skill_work_tickets > .claude/skills/work-tickets/SKILL.md
+  fi
+
+  # Set up symlinks in worktree
+  if [[ -n "$WORKTREE_PATH" && -d "$WORKTREE_PATH" ]]; then
+    print_step "Setting up symlinks in worktree..."
+    mkdir -p "$WORKTREE_PATH/.claude"
+    ln -sf "../../.claude/CLAUDE.md" "$WORKTREE_PATH/.claude/CLAUDE.md"
+    ln -sf "../../.claude/settings.local.json" "$WORKTREE_PATH/.claude/settings.local.json"
+  fi
+
+  print_success ".claude directory setup complete"
+}
+
+setup_workspace() {
+  print_step "Creating workspace file..."
+
+  local project_name=$(basename "$PROJECT_ROOT")
+  local workspace_file="${project_name}.code-workspace"
+
+  cat > "$workspace_file" << WORKSPACE
+{
+  "folders": [
+    {"name": "${DETECTED_DEFAULT_BRANCH:-main}", "path": "${DETECTED_DEFAULT_BRANCH:-main}"},
+    {"name": ".claude (shared)", "path": ".claude"}
+  ],
+  "settings": {
+    "git.repositoryScanMaxDepth": 1,
+    "files.exclude": {
+      "**/.git": true,
+      "**/node_modules": true
+    }
+  }
+}
+WORKSPACE
+
+  print_success "Workspace file created: $workspace_file"
+}
+
+install_wt_globally() {
+  local install_dir="${HOME}/.local/bin"
+
+  echo ""
+  prompt_yes_no INSTALL_GLOBAL "Install 'wt' command globally to $install_dir?" "y"
+
+  if [[ "$INSTALL_GLOBAL" == "true" ]]; then
+    mkdir -p "$install_dir"
+
+    if [[ -L "$install_dir/wt" ]]; then
+      rm "$install_dir/wt"
+    fi
+
+    ln -sf "$PROJECT_ROOT/.claude/bin/wt" "$install_dir/wt"
+    print_success "Installed wt to $install_dir/wt"
+
+    if [[ ":$PATH:" != *":$install_dir:"* ]]; then
+      print_warning "$install_dir is not in your PATH"
+      echo ""
+      echo "Add this to your shell config (~/.zshrc or ~/.bashrc):"
+      echo ""
+      echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+      echo ""
+    fi
+  fi
+}
+
+print_summary() {
+  echo ""
+  echo -e "${BOLD}${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${GREEN}║${NC}  ${BOLD}Setup Complete!${NC}                                          ${BOLD}${GREEN}║${NC}"
+  echo -e "${BOLD}${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "${BOLD}Project:${NC} $PROJECT_NAME"
+  echo -e "${BOLD}Location:${NC} $PROJECT_ROOT"
+  echo -e "${BOLD}Base Branch:${NC} $BASE_BRANCH"
+  echo ""
+  echo -e "${BOLD}${CYAN}Files Created:${NC}"
+  echo "  .claude/bin/wt              - Worktree management utility"
+  echo "  .claude/config.sh           - Project configuration"
+  echo "  .claude/CLAUDE.md           - Project documentation"
+  echo "  .claude/settings.local.json - Claude permissions"
+  echo "  .claude/skills/             - Claude skills"
+  echo ""
+  echo -e "${BOLD}${CYAN}Quick Start:${NC}"
+  echo ""
+  echo "  cd $PROJECT_ROOT"
+  echo ""
+  echo "  # Create a new worktree for a feature"
+  echo "  ./.claude/bin/wt add my-feature"
+  echo ""
+  echo "  # List all worktrees"
+  echo "  ./.claude/bin/wt list"
+  echo ""
+  echo "  # Open in Cursor/VS Code"
+  echo "  ./.claude/bin/wt open"
+  echo ""
+  echo -e "${BOLD}${CYAN}Available Skills:${NC}"
+  echo "  /commit          - Create conventional commits"
+  echo "  /pr              - Create GitHub PRs"
+  echo "  /plan-ticket     - Plan ticket implementation"
+  echo "  /implement-ticket - Implement planned tickets"
+  if [[ "$TICKET_SYSTEM" == "linear" ]]; then
+    echo "  /work-tickets    - Automated Linear workflow"
+  fi
+  echo ""
+}
+
+show_help() {
+  echo -e "${BOLD}cwt-init${NC} - Initialize Claude Code + git worktree workflow"
+  echo ""
+  echo -e "${BOLD}USAGE:${NC}"
+  echo "  cwt-init                      Interactive setup in current directory"
+  echo "  cwt-init <repo-url> <dir>     Clone and setup new project"
+  echo "  cwt-init --help               Show this help"
+  echo ""
+  echo -e "${BOLD}DESCRIPTION:${NC}"
+  echo "  Sets up a bare git repository with worktree support, optimized for"
+  echo "  parallel development with Claude Code AI agents."
+  echo ""
+  echo -e "${BOLD}FEATURES:${NC}"
+  echo "  - Bare git repo with worktree management"
+  echo "  - Shared .claude configuration across worktrees"
+  echo "  - Pre-configured skills for commits, PRs, and ticket workflows"
+  echo "  - VS Code/Cursor workspace file"
+  echo "  - Pre-commit verification hooks"
+  echo ""
+  echo -e "${BOLD}EXAMPLES:${NC}"
+  echo "  # Initialize a new project"
+  echo "  cwt-init git@github.com:org/repo.git my-project"
+  echo ""
+  echo "  # Add .claude setup to existing wt-managed project"
+  echo "  cd my-project  # must have .bare directory"
+  echo "  cwt-init"
+  echo ""
+}
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+main() {
+  print_header
+
+  # Parse arguments
+  if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    show_help
+    exit 0
+  fi
+
+  if [[ -n "$1" && -n "$2" ]]; then
+    # Clone and setup new project
+    local repo_url="$1"
+    local directory="$2"
+
+    if [[ -d "$directory" ]]; then
+      print_error "Directory '$directory' already exists"
+      exit 1
+    fi
+
+    setup_bare_repo "$repo_url" "$directory"
+  elif [[ -d ".bare" ]]; then
+    # Already a wt-managed project, just add .claude setup
+    PROJECT_ROOT="$PWD"
+    DETECTED_DEFAULT_BRANCH=$(cd .bare && git worktree list | grep -v ".bare" | head -1 | awk '{print $1}' | xargs basename)
+    WORKTREE_PATH="$PROJECT_ROOT/$DETECTED_DEFAULT_BRANCH"
+    print_success "Detected existing wt-managed project"
+  elif [[ -d ".git" ]]; then
+    print_error "This is a regular git repository, not a bare repo setup."
+    echo ""
+    echo "To convert to bare repo structure, run:"
+    echo "  cwt-init <remote-url> <new-directory>"
+    exit 1
+  else
+    print_error "Not in a git repository and no repo URL provided."
+    echo ""
+    echo "Usage:"
+    echo "  cwt-init <repo-url> <directory>"
+    exit 1
+  fi
+
+  # Collect configuration
+  collect_config
+
+  # Setup everything
+  setup_claude_directory
+  setup_workspace
+  install_wt_globally
+
+  # Print summary
+  print_summary
+}
+
+main "$@"
