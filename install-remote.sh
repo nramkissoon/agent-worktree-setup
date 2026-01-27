@@ -54,10 +54,11 @@ detect_platform() {
   OS="$(uname -s)"
   ARCH="$(uname -m)"
 
+  # shellcheck disable=SC2034  # PLATFORM used by caller
   case "$OS" in
     Linux*)  PLATFORM="linux" ;;
     Darwin*) PLATFORM="darwin" ;;
-    *)       PLATFORM="unknown" ;;  # shellcheck disable=SC2034
+    *)       PLATFORM="unknown" ;;
   esac
 
   case "$ARCH" in
