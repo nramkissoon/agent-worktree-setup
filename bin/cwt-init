@@ -363,7 +363,7 @@ cmd_add() {
     git worktree add "../$name" "$branch_name"
   else
     echo -e "${YELLOW}Creating new branch from $base_branch...${NC}"
-    git worktree add "../$name" "origin/$base_branch" -b "$branch_name"
+    git worktree add --no-track "../$name" "origin/$base_branch" -b "$branch_name"
   fi
   cd ..
 
